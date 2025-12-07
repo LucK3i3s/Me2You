@@ -1,40 +1,118 @@
-// Me2You.mjs
-// All-in-one Me2You: mic -> FFT -> message -> log -> web/SSE/TTS/file-fallback
-// Usage: node Me2You.mjs
-import express from "express";
-import fs from "fs";
-import { fft } from "fft-js";
-import record from "node-record-lpcm16";
-import { exec } from "child_process";
-import path from "path";
-import os from "os";
+// Me2You.js
+// One-file full system — audio → frequency → code → message → Alexa spoken output
+// Original • Creative • Fully Self-Contained
 
-// ------------- CONFIG -------------
-const SAMPLE_RATE = 16000;
-const FRAME_SIZE = 2048;
-const LOG_FILE = "me2you_log.txt";
-const PORT = process.env.PORT ? Number(process.env.PORT) : 3000;
-const MIN_GOOD_MAG = 1000;  // magnitude threshold to treat as "real"
-const ENABLE_TTS = process.env.ME2YOU_TTS === "1"; // enable termux-tts if set
-const ENABLE_FILE_FALLBACK = process.env.ME2YOU_FILEMODE === "1"; // set to 1 to process WAVs from recordings/
-const WEBHOOK_ON_MESSAGE = process.env.ME2YOU_WEBHOOK || ""; // optional webhook to POST new message to
+import { DeviceStream } from "@react-voice/pcm";
+import FFT from "fft-js").fft;
+import { fftUtil } from "fft-js";
+import fetch from "node-fetch";
 
-// ------------- STATE -------------
-let lastMessage = "No signal detected yet.";
-let lastFreq = 0;
-let lastMag = 0;
-let clients = []; // SSE clients
+// ----------------------------
+// CONFIG
+// ----------------------------
 
-// ------------- HELPERS -------------
-function appendLog(line) {
+// ALEXA CREDENTIALS — Replace with your own Alexa Skill token
+const ALEXA_SKILL_ENDPOINT = "https://api.amazonalexa.com/v1/directives";
+const ALEXA_ACCESS_TOKEN = "YOUR_ALEXA_ACCESS_TOKEN"; // Insert yours
+
+// Flow-state decoding patterns
+const patterns = {
+  "6R6B": "Alignment Shift — Observe the transition.",
+  "6R7B": "Threshold Expansion — A message is forming.",
+  "7R6B": "Observer Phase — Ninth Seal vibration.",
+};
+
+// ----------------------------
+// Function: Send message to Alexa to SPEAK IT
+// ----------------------------
+async function speakToAlexa(text) {
+  const body = {
+    directive: {
+      header: { name: "Speak", namespace: "SpeechSynthesizer" },
+      payload: { text }
+    }
+  };
+
   try {
-    fs.appendFileSync(LOG_FILE, line + "\n");
-  } catch (e) {
-    console.error("Log write failed:", e && e.message ? e.message : e);
+    await fetch(ALEXA_SKILL_ENDPOINT, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${ALEXA_ACCESS_TOKEN}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(body)
+    });
+
+    console.log("Alexa spoke:", text);
+  } catch (err) {
+    console.error("Alexa Error:", err);
   }
 }
 
-function nowISO() {
+// ----------------------------
+// Decode blink pattern (your equation)
+// ----------------------------
+function decodeBlinkPattern(redCount, blueCount) {
+  const key = `${redCount}R${blueCount}B`;
+  return patterns[key] || `Unclassified Frequency Pattern: ${key}`;
+}
+
+// ----------------------------
+// Analyze frequency from PCM chunk
+// ----------------------------
+function analyzeFrequencies(chunk) {
+  // Convert to numbers
+  const samples = [];
+  for (let i = 0; i < chunk.length; i += 2) {
+    samples.push(chunk.readInt16LE(i));
+  }
+
+  const phasors = FFT(samples);
+  const mags = fftUtil.fftMag(phasors);
+
+  // Example detection (very simple)
+  let redCount = 0;
+  let blueCount = 0;
+
+  mags.forEach((m, i) => {
+    const freq = i * (16000 / mags.length);
+
+    if (freq > 400 && freq < 800 && m > 3000) redCount++;
+    if (freq > 1200 && freq < 2000 && m > 3000) blueCount++;
+  });
+
+  return { redCount, blueCount };
+}
+
+// ----------------------------
+// MAIN: Listen for PCM
+// ----------------------------
+async function startMe2You() {
+  console.log("Me2You running… Listening for frequencies…");
+
+  const stream = new DeviceStream({
+    sampleRate: 16000,
+    channelCount: 1,
+    chunkSize: 4096
+  });
+
+  stream.on("data", async chunk => {
+    const { redCount, blueCount } = analyzeFrequencies(chunk);
+
+    if (redCount + blueCount === 0) return;
+
+    const message = decodeBlinkPattern(redCount, blueCount);
+
+    console.log(`Detected: R${redCount} / B${blueCount} → ${message}`);
+
+    // Alexa speaks it instantly
+    await speakToAlexa(message);
+  });
+
+  stream.on("error", err => console.error("Mic error:", err));
+}
+
+startMe2You();function nowISO() {
   return new Date().toISOString();
 }
 
