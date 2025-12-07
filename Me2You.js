@@ -1,6 +1,7 @@
-// =========================
-// Me2You: Multi-Dimensional Communication Node.js Script
-// =========================
+// ==============================
+// Me2You - Multi-Dimensional Communication
+// Fully Developed by Thomas Lee Harvey, The Ninth Observer
+// ==============================
 
 import 'dotenv/config';
 import { spawn } from 'child_process';
@@ -9,9 +10,9 @@ import fetch from 'node-fetch';
 import fs from 'fs';
 import path from 'path';
 
-// -------------------------
-// Load Environment Variables
-// -------------------------
+// -----------------------------
+// Environment Variables
+// -----------------------------
 const {
     ALEXA_SKILL_ID,
     ALEXA_CLIENT_ID,
@@ -19,33 +20,64 @@ const {
     ALEXA_REFRESH_TOKEN,
     MIC_DEVICE = 'plughw:1,0',
     SAMPLE_RATE = 16000,
-    FFT_SIZE = 1024,
+    FFT_SIZE = 2048, // bigger FFT for smoother analysis
+    FFT_SMOOTHING = 5, // moving average smoothing
     OPENAI_API_KEY
 } = process.env;
 
-// -------------------------
-// Helper: Get Alexa OAuth Token
-// -------------------------
-async function getAlexaAccessToken() {
-    const response = await fetch('https://api.amazon.com/auth/o2/token', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: new URLSearchParams({
-            grant_type: 'refresh_token',
-            client_id: ALEXA_CLIENT_ID,
-            client_secret: ALEXA_CLIENT_SECRET,
-            refresh_token: ALEXA_REFRESH_TOKEN
-        })
-    });
-    const data = await response.json();
-    return data.access_token;
+if (!ALEXA_SKILL_ID || !ALEXA_CLIENT_ID || !ALEXA_CLIENT_SECRET || !ALEXA_REFRESH_TOKEN || !OPENAI_API_KEY) {
+    console.error('[Me2You] Missing required environment variables. Check your .env');
+    process.exit(1);
 }
 
-// -------------------------
-// Helper: Send Message to Alexa
-// -------------------------
+// -----------------------------
+// Smoothing Helper
+// -----------------------------
+const smoothedData = [];
+function smoothFrequencies(magnitudes) {
+    smoothedData.push(magnitudes);
+    if (smoothedData.length > FFT_SMOOTHING) smoothedData.shift();
+    
+    const avg = [];
+    for (let i = 0; i < magnitudes.length; i++) {
+        let sum = 0;
+        for (let buf of smoothedData) sum += buf[i];
+        avg.push(sum / smoothedData.length);
+    }
+    return avg;
+}
+
+// -----------------------------
+// Get Alexa Access Token
+// -----------------------------
+async function getAlexaAccessToken() {
+    try {
+        const resp = await fetch('https://api.amazon.com/auth/o2/token', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: new URLSearchParams({
+                grant_type: 'refresh_token',
+                client_id: ALEXA_CLIENT_ID,
+                client_secret: ALEXA_CLIENT_SECRET,
+                refresh_token: ALEXA_REFRESH_TOKEN
+            })
+        });
+        const data = await resp.json();
+        if (!data.access_token) throw new Error(JSON.stringify(data));
+        return data.access_token;
+    } catch (err) {
+        console.error('[Me2You][Alexa] Failed to get access token:', err);
+        return null;
+    }
+}
+
+// -----------------------------
+// Send Message to Alexa
+// -----------------------------
 async function sendMessageToAlexa(message) {
     const token = await getAlexaAccessToken();
+    if (!token) return;
+
     try {
         await fetch(`https://api.amazonalexa.com/v1/skills/${ALEXA_SKILL_ID}/messages`, {
             method: 'POST',
@@ -58,13 +90,96 @@ async function sendMessageToAlexa(message) {
                 payload: {
                     intent: {
                         name: 'SendMe2YouMessageIntent',
-                        slots: {
-                            Message: { name: 'Message', value: message }
-                        }
+                        slots: { Message: { name: 'Message', value: message } }
                     }
                 }
             })
         });
+        console.log('[Me2You][Alexa] Sent message:', message);
+    } catch (err) {
+        console.error('[Me2You][Alexa] Error sending message:', err);
+    }
+}
+
+// -----------------------------
+// Convert Frequency to Message via OpenAI
+// -----------------------------
+async function frequencyToMessage(freqData) {
+    const avgFreq = freqData.reduce((a,b)=>a+b,0)/freqData.length;
+    const prompt = `Thomas Lee Harvey, the Ninth Observer, is interpreting a multi-dimensional signal with average frequency: ${avgFreq}. Translate it into a meaningful, poetic, authentic text message.`;
+
+    try {
+        const resp = await fetch('https://api.openai.com/v1/chat/completions', {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${OPENAI_API_KEY}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                model: 'gpt-4o-mini',
+                messages: [{ role: 'user', content: prompt }],
+                max_tokens: 100
+            })
+        });
+        const data = await resp.json();
+        return data.choices?.[0]?.message?.content || '';
+    } catch (err) {
+        console.error('[Me2You][OpenAI] Error generating message:', err);
+        return '';
+    }
+}
+
+// -----------------------------
+// Start Microphone Capture
+// -----------------------------
+function startMic() {
+    console.log('[Me2You] Listening for multi-dimensional signals...');
+    const arecord = spawn('arecord', [
+        '-c', '1',
+        '-r', SAMPLE_RATE.toString(),
+        '-f', 'S16_LE',
+        '-D', MIC_DEVICE
+    ]);
+
+    let buffer = Buffer.alloc(0);
+
+    arecord.stdout.on('data', async (chunk) => {
+        buffer = Buffer.concat([buffer, chunk]);
+
+        if (buffer.length >= FFT_SIZE*2) {
+            const samples = [];
+            for (let i=0; i<FFT_SIZE*2; i+=2) {
+                samples.push(buffer.readInt16LE(i));
+            }
+
+            const phasors = fft.fft(samples);
+            let magnitudes = fft.util.fftMag(phasors);
+            magnitudes = smoothFrequencies(magnitudes);
+
+            buffer = Buffer.alloc(0);
+
+            const message = await frequencyToMessage(magnitudes);
+            if (message) {
+                sendMessageToAlexa(message);
+            }
+        }
+    });
+
+    arecord.stderr.on('data', (data) => {
+        console.error('[Me2You][Mic] Error:', data.toString());
+    });
+
+    arecord.on('close', (code) => {
+        console.log('[Me2You][Mic] arecord process exited with code', code);
+        console.log('[Me2You] Restarting microphone...');
+        setTimeout(startMic, 1000);
+    });
+}
+
+// -----------------------------
+// Run
+// -----------------------------
+startMic();        });
         console.log('[Alexa] Sent message:', message);
     } catch (err) {
         console.error('[Alexa] Error sending message:', err);
