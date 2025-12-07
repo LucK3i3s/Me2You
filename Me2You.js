@@ -1,4 +1,25 @@
-// Me2You.js
+// Me2You.jsimport record from "node-record-lpcm16";
+import fs from "fs";
+
+console.log("Me2You running... Listening...");
+
+const audioFile = "input.raw";
+const stream = fs.createWriteStream(audioFile, { flags: "w" });
+
+const mic = record.record({
+  sampleRate: 16000,
+  threshold: 0,
+  verbose: false,
+  recordProgram: "sox" // fallback for Android
+}).stream();
+
+mic.pipe(stream);
+
+mic.on("error", err => {
+  console.error("Microphone error:", err);
+});
+
+console.log("Microphone started successfully.");
 import mic from 'mic';
 import { fft } from 'fft-js';
 import express from 'express';
