@@ -1,272 +1,149 @@
-// Me2You.mjs
-// Single-file Me2You — Termux-compatible, creative, complete
-import dotenv from 'dotenv';
-dotenv.config();
-console.log("Alexa Skill ID:", process.env.ALEXA_SKILL_ID);// Usage: set config below, then: node Me2You.mjs
-import { spawn } from "child_process";
-import fs from "fs";
-import path from "path";
-import { fft } from "fft-js";
-import crypto from "crypto";
-import os from "os";
-import http from "http";
-import express from "express";
+// =========================
+// Me2You: Multi-Dimensional Communication Node.js Script
+// =========================
 
-// ---------------- CONFIGURATION ----------------
-// Edit these constants to fit your environment
-const SAMPLE_RATE = 16000;
-const FRAME_SIZE = 2048;
-const PORT = process.env.PORT ? Number(process.env.PORT) : 3000;
-const LOG_FILE = "me2you_log.txt";
-const MIN_MAGNITUDE = 1000;       // threshold to call a peak "real"
-const ENABLE_TTS = process.env.ME2YOU_TTS === "1";         // termux-tts on new message
-const ENABLE_VIBRATE = process.env.ME2YOU_VIBE === "1";    // termux-vibrate on new message
-const ENABLE_OBSERVER = process.env.ME2YOU_OBSERVER === "1";// ascii visual
-const SILENT_MODE = process.env.ME2YOU_SILENT === "1";     // no TTS/vibe/logging if set
-const ENABLE_FILE_FALLBACK = process.env.ME2YOU_FILEMODE === "1"; // watch recordings/
+import 'dotenv/config';
+import { spawn } from 'child_process';
+import fft from 'fft-js';
+import fetch from 'node-fetch';
+import fs from 'fs';
+import path from 'path';
 
-// Optional webhook to forward messages (will be AES-GCM encrypted if ENCRYPTION_KEY set)
-const WEBHOOK_URL = process.env.ME2YOU_WEBHOOK || ""; // e.g. https://your-server/receive
+// -------------------------
+// Load Environment Variables
+// -------------------------
+const {
+    ALEXA_SKILL_ID,
+    ALEXA_CLIENT_ID,
+    ALEXA_CLIENT_SECRET,
+    ALEXA_REFRESH_TOKEN,
+    MIC_DEVICE = 'plughw:1,0',
+    SAMPLE_RATE = 16000,
+    FFT_SIZE = 1024,
+    OPENAI_API_KEY
+} = process.env;
 
-// Encryption: 32-byte base64 key for AES-GCM (optional)
-const ENCRYPTION_KEY_B64 = process.env.ME2YOU_KEY_B64 || ""; // set if you want encrypted webhooks
-
-// Alexa / external fetch usage:
-// For simple Alexa skill use: skill will call your /alexa endpoint (see instructions)
-// For advanced push to Alexa you need AWS + Alexa notifications (advanced)
-const ALLOW_PUBLIC = true; // if true you can expose via ngrok; otherwise keep local
-
-// Custom signature mapping (your "flow-state equation")
-// Fill with signature keys -> messages. Signature keys are strings like "6R6B"
-const SIGNATURES = {
-  "6R6B": "Alignment Shift — Observe the transition.",
-  "6R7B": "Threshold Expansion — A message is forming.",
-  "7R6B": "Observer Phase — Ninth Seal vibration.",
-  // add your own custom patterns...
-};
-
-// ---------------- STATE ----------------
-let lastMessage = "No signal detected yet.";
-let lastFreq = 0;
-let lastMag = 0;
-let lastSignatureKey = null;
-
-// SSE clients
-const sseClients = [];
-
-// ---------------- HELPERS ----------------
-function nowISO() { return new Date().toISOString(); }
-function appendLog(line) {
-  try { fs.appendFileSync(LOG_FILE, line + os.EOL); } catch (e) { /* ignore */ }
-}
-function encryptPayload(plain) {
-  if (!ENCRYPTION_KEY_B64) return null;
-  const key = Buffer.from(ENCRYPTION_KEY_B64, "base64");
-  const iv = crypto.randomBytes(12);
-  const cipher = crypto.createCipheriv("aes-256-gcm", key, iv);
-  const enc = Buffer.concat([cipher.update(Buffer.from(plain, "utf8")), cipher.final()]);
-  const tag = cipher.getAuthTag();
-  return Buffer.concat([iv, tag, enc]).toString("base64");
-}
-function sha1hex(s) { return crypto.createHash("sha1").update(s).digest("hex"); }
-
-// Convert PCM Buffer (Int16LE) to normalized float samples (-1..1)
-function bufferToSamples(buffer) {
-  const sampleCount = Math.floor(buffer.length / 2);
-  const out = new Array(sampleCount);
-  for (let i = 0; i < sampleCount; i++) {
-    out[i] = buffer.readInt16LE(i * 2) / 32768;
-  }
-  return out;
+// -------------------------
+// Helper: Get Alexa OAuth Token
+// -------------------------
+async function getAlexaAccessToken() {
+    const response = await fetch('https://api.amazon.com/auth/o2/token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+            grant_type: 'refresh_token',
+            client_id: ALEXA_CLIENT_ID,
+            client_secret: ALEXA_CLIENT_SECRET,
+            refresh_token: ALEXA_REFRESH_TOKEN
+        })
+    });
+    const data = await response.json();
+    return data.access_token;
 }
 
-// Run FFT and return magnitudes
-function runFFT(samples) {
-  // ensure length FRAME_SIZE
-  if (samples.length < FRAME_SIZE) {
-    samples = samples.concat(new Array(FRAME_SIZE - samples.length).fill(0));
-  } else if (samples.length > FRAME_SIZE) {
-    samples = samples.slice(0, FRAME_SIZE);
-  }
-  const ph = fft(samples);
-  const mags = ph.map(([r, i]) => Math.sqrt(r*r + i*i));
-  return mags;
-}
-
-// Find dominant freq and magnitude
-function dominantFreqFromMags(mags, sampleRate) {
-  const half = Math.floor(mags.length / 2);
-  let idx = 1, max = -Infinity;
-  for (let i = 1; i < half; i++) {
-    if (mags[i] > max) { max = mags[i]; idx = i; }
-  }
-  const freq = idx * (sampleRate / mags.length);
-  return { freq, mag: max };
-}
-
-// Map freq -> yes/no/maybe
-function interpretYesNo(freq) {
-  if (!freq || isNaN(freq)) return "MAYBE";
-  if (freq > 1000) return "YES";
-  if (freq < 200) return "NO";
-  return "MAYBE";
-}
-function mapColor(freq) {
-  if (!freq || isNaN(freq)) return "Gray";
-  if (freq < 300) return "Red";
-  if (freq < 700) return "Green";
-  if (freq < 1500) return "Blue";
-  return "Violet";
-}
-
-// Flow-state signature detector — counts "red band" and "blue band" peaks within the FFT frame
-function detectSignature(mags) {
-  let red = 0, blue = 0;
-  const N = mags.length;
-  for (let i = 1; i < Math.floor(N/2); i++) {
-    const freq = i * (SAMPLE_RATE / N);
-    const m = mags[i];
-    // thresholds tuned heuristically; you can tweak
-    if (freq >= 420 && freq <= 850 && m > MIN_MAGNITUDE) red++;
-    if (freq >= 1200 && freq <= 2000 && m > MIN_MAGNITUDE) blue++;
-  }
-  const key = `${red}R${blue}B`;
-  return { red, blue, key };
-}
-
-// Tiny ASCII observer sparkline
-function asciiSpark(mags) {
-  const half = Math.floor(mags.length/2);
-  const slice = mags.slice(0, half);
-  const max = Math.max(...slice) || 1;
-  let s = "";
-  const width = 60;
-  for (let i = 0; i < width; i++) {
-    const idx = Math.floor((i/width) * slice.length);
-    const v = slice[idx] / max;
-    s += (v > 0.7 ? "#" : v > 0.4 ? "+" : v > 0.15 ? "-" : " ");
-  }
-  return s;
-}
-
-// send webhook (encrypted if key provided)
-function sendWebhook(obj) {
-  if (!WEBHOOK_URL) return;
-  try {
-    const payload = JSON.stringify(obj);
-    const enc = ENCRYPTION_KEY_B64 ? encryptPayload(payload) : payload;
-    const curl = spawn("curl", ["-s", "-X", "POST", "-H", "Content-Type: application/json", "-d", enc, WEBHOOK_URL], { stdio: "ignore" });
-    curl.on("error", ()=>{});
-  } catch(e){}
-}
-
-// TTS and vibrate helpers (Termux)
-function ttsSpeak(text) {
-  if (!ENABLE_TTS || SILENT_MODE) return;
-  // termux-tts-speak must be installed (pkg install termux-api)
-  spawn("termux-tts-speak", [text]);
-}
-function vibratePattern() {
-  if (!ENABLE_VIBRATE || SILENT_MODE) return;
-  // short vibration
-  spawn("termux-vibrate", ["-d", "200"]);
-}
-
-// New message handler
-function onNewMessage(freq, mag, mags) {
-  const yesNo = (mag && mag > MIN_MAGNITUDE) ? interpretYesNo(freq) : "MAYBE";
-  const color = mapColor(freq);
-  const signature = detectSignature(mags);
-  lastFreq = freq; lastMag = mag;
-  const signatureKey = signature.key;
-  lastSignatureKey = signatureKey;
-
-  // signature message mapping
-  const signatureMsg = SIGNATURES[signatureKey] || (signature.red+signature.blue > 0 ? `Pattern ${signatureKey}` : "");
-  const creativeMsg = (yesNo === "YES" ? "Affirmative signal." : yesNo === "NO" ? "No clear signal." : "Unclear response.");
-  const fullMessage = `${creativeMsg} Color: ${color}. Peak: ${freq.toFixed(1)} Hz. ${signatureMsg}`;
-
-  lastMessage = fullMessage;
-
-  const log = `[${nowISO()}] ${fullMessage} (sig=${signatureKey} red=${signature.red} blue=${signature.blue} mag=${Math.round(mag)})`;
-  if (!SILENT_MODE) console.log(log);
-  appendLog(log);
-
-  // SSE broadcast
-  const sseObj = { ts: nowISO(), message: fullMessage, freq: Number(freq.toFixed(2)), mag: Math.round(mag), signature: signatureKey };
-  const sseStr = `data: ${JSON.stringify(sseObj)}\n\n`;
-  for (const res of sseClients) {
-    try { res.write(sseStr); } catch(e){}
-  }
-
-  // actions
-  if (!SILENT_MODE) {
-    ttsSpeak(fullMessage);
-    vibratePattern();
-  }
-
-  // webhook (encrypted if key set)
-  sendWebhook(sseObj);
-}
-
-// ---------------- RECORDING & PROCESS ----------------
-let recorderProc = null;
-function startRecordingStream() {
-  // Use termux-microphone-record to write a rolling file and we will stream in chunks.
-  // Alternatively we spawn the CLI and read the wav file repeatedly.
-  // We'll create /data/data/com.termux/files/home/me2you/audio_stream.wav
-  const out = path.join(process.cwd(), "audio_stream.wav");
-  // Remove existing if present
-  try { if (fs.existsSync(out)) fs.unlinkSync(out); } catch(e){}
-
-  // run termux-microphone-record with -l infinity and write to audio_stream.wav
-  recorderProc = spawn("termux-microphone-record", ["-l", "infinity", "-f", "wav", "-o", out], { detached: true });
-
-  recorderProc.on("error", (e) => {
-    console.error("Recorder start failed:", e && e.message ? e.message : e);
-    console.error("Make sure termux-api is installed and granted microphone permission.");
-  });
-
-  recorderProc.on("spawn", () => {
-    if (!SILENT_MODE) console.log("Recorder spawned; audio file:", out);
-  });
-
-  // Poll the file for new data and read frames
-  let lastRead = 0;
-  const frameBytes = FRAME_SIZE * 2; // 2 bytes per sample (Int16)
-  setInterval(() => {
+// -------------------------
+// Helper: Send Message to Alexa
+// -------------------------
+async function sendMessageToAlexa(message) {
+    const token = await getAlexaAccessToken();
     try {
-      if (!fs.existsSync(out)) return;
-      const stats = fs.statSync(out);
-      if (stats.size <= 44 + lastRead) return; // WAV header 44 bytes
-      const fd = fs.openSync(out, "r");
-      const start = 44 + lastRead;
-      const toRead = Math.min(frameBytes * 4, stats.size - start); // read a chunk of several frames
-      const buf = Buffer.alloc(toRead);
-      fs.readSync(fd, buf, 0, toRead, start);
-      fs.closeSync(fd);
-      // process buffer in FRAME_SIZE-chunks
-      let pos = 0;
-      while (pos + frameBytes <= buf.length) {
-        const frameBuf = buf.slice(pos, pos + frameBytes);
-        const samples = bufferToSamples(frameBuf);
-        const mags = runFFT(samples);
-        const { freq, mag } = dominantFreqFromMags(mags, SAMPLE_RATE);
-        if (mag > MIN_MAGNITUDE) onNewMessage(freq, mag, mags);
-        else onNewMessage(freq, mag, mags); // still process but may be MAYBE
-        pos += frameBytes;
-      }
-      lastRead += pos;
-    } catch (e) {
-      // ignore transient read errors
+        await fetch(`https://api.amazonalexa.com/v1/skills/${ALEXA_SKILL_ID}/messages`, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${token}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                type: 'intentRequest',
+                payload: {
+                    intent: {
+                        name: 'SendMe2YouMessageIntent',
+                        slots: {
+                            Message: { name: 'Message', value: message }
+                        }
+                    }
+                }
+            })
+        });
+        console.log('[Alexa] Sent message:', message);
+    } catch (err) {
+        console.error('[Alexa] Error sending message:', err);
     }
-  }, 600); // poll ~every 600ms
 }
 
-// File fallback: watch recordings/ and process new files
-function watchRecordings() {
-  const dir = path.join(process.cwd(), "recordings");
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir);
+// -------------------------
+// Helper: Convert Frequency Array to Message (via OpenAI)
+// -------------------------
+async function frequencyToMessage(freqData) {
+    const avgFreq = freqData.reduce((a,b)=>a+b,0)/freqData.length;
+    const prompt = `Interpret the following frequency data as a meaningful text message: ${avgFreq}`;
+    
+    const response = await fetch('https://api.openai.com/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+            'Authorization': `Bearer ${OPENAI_API_KEY}`,
+            'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+            model: 'gpt-4o-mini',
+            messages: [{ role: 'user', content: prompt }],
+            max_tokens: 50
+        })
+    });
+    const data = await response.json();
+    return data.choices?.[0]?.message?.content || '';
+}
+
+// -------------------------
+// Start Mic Listening via arecord
+// -------------------------
+function startMic() {
+    console.log('[Me2You] Listening for frequencies...');
+    
+    const arecord = spawn('arecord', [
+        '-c', '1',
+        '-r', SAMPLE_RATE.toString(),
+        '-f', 'S16_LE',
+        '-D', MIC_DEVICE
+    ]);
+
+    let buffer = Buffer.alloc(0);
+
+    arecord.stdout.on('data', async (chunk) => {
+        buffer = Buffer.concat([buffer, chunk]);
+
+        // Once buffer reaches FFT_SIZE, analyze
+        if (buffer.length >= FFT_SIZE*2) {
+            const samples = [];
+            for (let i=0; i<FFT_SIZE*2; i+=2) {
+                samples.push(buffer.readInt16LE(i));
+            }
+
+            const phasors = fft.fft(samples);
+            const magnitudes = fft.util.fftMag(phasors);
+            buffer = Buffer.alloc(0);
+
+            // Convert frequency to message
+            const message = await frequencyToMessage(magnitudes);
+            if(message) {
+                sendMessageToAlexa(message);
+            }
+        }
+    });
+
+    arecord.stderr.on('data', (data) => {
+        console.error('[arecord error]', data.toString());
+    });
+
+    arecord.on('close', (code) => {
+        console.log('[arecord] Process exited with code', code);
+    });
+}
+
+// -------------------------
+// Run
+// -------------------------
+startMic();.existsSync(dir)) fs.mkdirSync(dir);
   fs.watch(dir, (evt, fname) => {
     if (!fname) return;
     setTimeout(() => {
