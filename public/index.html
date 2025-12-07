@@ -1,42 +1,49 @@
 <!DOCTYPE html>
 <html>
 <head>
-  <title>Me2You UI</title>
-  <style>
-    body { background:black; color:white; font-family:sans-serif; }
-    #spectrum { display:flex; }
-    .bar { width:6px; margin:1px; background:green; }
-    #messages { margin-top:10px; height:150px; overflow:auto; }
-  </style>
+<title>Me2You - Multi-Dimensional Mapping</title>
+<style>
+body{background:black;color:white;font-family:sans-serif;}
+#spectrum{display:flex;height:150px;}
+.bar{width:6px;margin:1px;}
+#symbols,#dimAlert,#messages{margin-top:5px;}
+</style>
 </head>
 <body>
-  <h1>Me2You - Multi-Dimensional Mapping</h1>
-  <div id="spectrum"></div>
-  <div id="symbols"></div>
-  <div id="messages"></div>
-  <script src="/socket.io/socket.io.js"></script>
-  <script>
-    const socket = io();
-    const spectrumDiv = document.getElementById('spectrum');
-    const symbolsDiv = document.getElementById('symbols');
-    const messagesDiv = document.getElementById('messages');
+<h1>Me2You - Multi-Dimensional Mapping</h1>
+<div id="spectrum"></div>
+<div id="symbols"></div>
+<div id="dimAlert"></div>
+<div id="messages"></div>
+<script src="/socket.io/socket.io.js"></script>
+<script>
+const socket=io();
+const spectrum=document.getElementById('spectrum');
+const symbolsDiv=document.getElementById('symbols');
+const dimAlertDiv=document.getElementById('dimAlert');
+const messagesDiv=document.getElementById('messages');
 
-    socket.on('frequency', data => {
-      spectrumDiv.innerHTML = '';
-      data.magnitudes.forEach(m => {
-        const bar = document.createElement('div');
-        bar.className='bar';
-        bar.style.height=(m/Math.max(...data.magnitudes)*100)+'px';
-        spectrumDiv.appendChild(bar);
-      });
-      symbolsDiv.innerText = 'Active Symbols: '+data.symbols.join(' | ');
-      if(data.message){
-        const msg = document.createElement('div');
-        msg.innerText = `[${new Date().toLocaleTimeString()}] ${data.message}`;
-        messagesDiv.appendChild(msg);
-        messagesDiv.scrollTop = messagesDiv.scrollHeight;
-      }
-    });
-  </script>
+socket.on('frequency',data=>{
+  spectrum.innerHTML='';
+  const maxMag=Math.max(...data.magnitudes);
+  data.magnitudes.forEach((m,i)=>{
+    const bar=document.createElement('div');
+    bar.className='bar';
+    bar.style.height=(m/maxMag*100)+'px';
+    if(i<27) bar.style.background='blue';
+    else if(i<54) bar.style.background='green';
+    else bar.style.background='red';
+    spectrum.appendChild(bar);
+  });
+  symbolsDiv.innerText='Active Symbols: '+data.symbols.join(' | ');
+  dimAlertDiv.innerText=data.dimAlert||'';
+  if(data.message){
+    const msg=document.createElement('div');
+    msg.innerText=`[${new Date().toLocaleTimeString()}] ${data.message}`;
+    messagesDiv.appendChild(msg);
+    messagesDiv.scrollTop=messagesDiv.scrollHeight;
+  }
+});
+</script>
 </body>
 </html>
