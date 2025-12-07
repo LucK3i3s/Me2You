@@ -1,6 +1,8 @@
 // Me2You.mjs
 // Single-file Me2You — Termux-compatible, creative, complete
-// Usage: set config below, then: node Me2You.mjs
+import dotenv from 'dotenv';
+dotenv.config();
+console.log("Alexa Skill ID:", process.env.ALEXA_SKILL_ID);// Usage: set config below, then: node Me2You.mjs
 import { spawn } from "child_process";
 import fs from "fs";
 import path from "path";
