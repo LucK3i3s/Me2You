@@ -1,39 +1,74 @@
 // Me2You.mjs
-// Single-file, Termux-friendly "Me2You" — microphone -> FFT -> message -> web endpoint
-// Creative & minimal: record -> analyze -> log -> serve
+// All-in-one Me2You: mic -> FFT -> message -> log -> web/SSE/TTS/file-fallback
 // Usage: node Me2You.mjs
+import express from "express";
+import fs from "fs";
+import { fft } from "fft-js";
+import record from "node-record-lpcm16";
+import { exec } from "child_process";
+import path from "path";
+import os from "os";
 
-import express from 'express';
-import fs from 'fs';
-import { fft } from 'fft-js';
-import record from 'node-record-lpcm16';
+// ------------- CONFIG -------------
+const SAMPLE_RATE = 16000;
+const FRAME_SIZE = 2048;
+const LOG_FILE = "me2you_log.txt";
+const PORT = process.env.PORT ? Number(process.env.PORT) : 3000;
+const MIN_GOOD_MAG = 1000;  // magnitude threshold to treat as "real"
+const ENABLE_TTS = process.env.ME2YOU_TTS === "1"; // enable termux-tts if set
+const ENABLE_FILE_FALLBACK = process.env.ME2YOU_FILEMODE === "1"; // set to 1 to process WAVs from recordings/
+const WEBHOOK_ON_MESSAGE = process.env.ME2YOU_WEBHOOK || ""; // optional webhook to POST new message to
 
-// ---------- CONFIG ----------
-const SAMPLE_RATE = 16000;         // audio sample rate (Hz)
-const FRAME_SIZE = 2048;           // number of samples per FFT (power of two)
-const LOG_FILE = 'me2you_log.txt';
-const PORT = process.env.PORT ? parseInt(process.env.PORT) : 3000;
-const MIN_GOOD_MAG = 1000;         // optional threshold to consider a spike "real"
-const ENABLE_ASCII = false;        // set true to print tiny ASCII spectrum
-
-// ---------- STATE ----------
+// ------------- STATE -------------
 let lastMessage = "No signal detected yet.";
 let lastFreq = 0;
-let running = false;
+let lastMag = 0;
+let clients = []; // SSE clients
 
-// ---------- HELPERS ----------
-function getDominantFrequency(magnitudes, sampleRate) {
-  // only consider up to Nyquist (first half)
-  const half = Math.floor(magnitudes.length / 2);
+// ------------- HELPERS -------------
+function appendLog(line) {
+  try {
+    fs.appendFileSync(LOG_FILE, line + "\n");
+  } catch (e) {
+    console.error("Log write failed:", e && e.message ? e.message : e);
+  }
+}
+
+function nowISO() {
+  return new Date().toISOString();
+}
+
+function bufferToSamples(buffer) {
+  const sampleCount = Math.floor(buffer.length / 2);
+  const samples = new Array(sampleCount);
+  for (let i = 0; i < sampleCount; i++) {
+    samples[i] = buffer.readInt16LE(i * 2) / 32768;
+  }
+  return samples;
+}
+
+function runFFTOnSamples(samples) {
+  if (samples.length < FRAME_SIZE) {
+    samples = samples.concat(new Array(FRAME_SIZE - samples.length).fill(0));
+  } else if (samples.length > FRAME_SIZE) {
+    samples = samples.slice(0, FRAME_SIZE);
+  }
+  const phasors = fft(samples);
+  const mags = phasors.map(([r, i]) => Math.sqrt(r * r + i * i));
+  return mags;
+}
+
+function getDominantFrequency(mags, sampleRate) {
+  const half = Math.floor(mags.length / 2);
   let max = -Infinity;
   let idx = 0;
   for (let i = 1; i < half; i++) {
-    if (magnitudes[i] > max) {
-      max = magnitudes[i];
+    if (mags[i] > max) {
+      max = mags[i];
       idx = i;
     }
   }
-  const freq = idx * (sampleRate / magnitudes.length);
+  const freq = idx * (sampleRate / mags.length);
   return { freq, magnitude: max };
 }
 
@@ -62,145 +97,185 @@ function generateMessage(freq, yesNo, color, mag) {
   return m;
 }
 
-function logLine(freq, yesNo, color, message) {
-  const ts = new Date().toISOString();
-  const line = `[${ts}] Freq:${freq.toFixed(2)}Hz | ${yesNo} | ${color} | ${message}\n`;
-  fs.appendFileSync(LOG_FILE, line);
+function broadcastToSSE(msgObj) {
+  const data = `data: ${JSON.stringify(msgObj)}\n\n`;
+  clients.forEach((res) => {
+    try { res.write(data); } catch (e) { /* ignore */ }
+  });
 }
 
-// tiny ASCII sparkline for debug
-function asciiSpectrum(mags) {
-  const half = Math.floor(mags.length / 2);
-  const slice = Array.from(mags.slice(0, half));
-  const max = Math.max(...slice);
-  let out = "";
-  for (let i = 0; i < 40; i++) {
-    const idx = Math.floor((i / 40) * slice.length);
-    const val = slice[idx] / max;
-    out += (val > 0.7 ? "#" : val > 0.4 ? "+" : val > 0.15 ? "-" : " ");
-  }
-  return out;
+function speakTermuxTTS(text) {
+  if (!ENABLE_TTS) return;
+  // prefer termux-tts-speak (Termux API). Fall back to 'espeak' if available.
+  // This only works on Android with termux-api installed and permission granted.
+  exec(`termux-tts-speak ${JSON.stringify(text)}`, (err) => {
+    if (err) {
+      // fallback attempt
+      exec(`espeak ${JSON.stringify(text)}`, () => {});
+    }
+  });
 }
 
-// ---------- AUDIO -> BUFFER HANDLING ----------
-/*
- node-record-lpcm16 emits raw PCM buffers (Int16LE). We'll collect bytes until we
- have FRAME_SIZE Int16 samples (FRAME_SIZE*2 bytes), convert them to numbers,
- run FFT, and analyze.
-*/
-function bufferToSamples(buffer) {
-  // ensure even length
-  const sampleCount = Math.floor(buffer.length / 2);
-  const samples = new Array(sampleCount);
-  for (let i = 0; i < sampleCount; i++) {
-    samples[i] = buffer.readInt16LE(i * 2) / 32768; // normalize to -1..1
-  }
-  return samples;
+function notifyWebhook(payload) {
+  if (!WEBHOOK_ON_MESSAGE) return;
+  // simple POST using curl (keeping file single and avoiding extra npm deps)
+  const tmp = JSON.stringify(payload).replace(/"/g, '\\"');
+  const cmd = `curl -s -X POST -H "Content-Type: application/json" -d "${tmp}" ${WEBHOOK_ON_MESSAGE} >/dev/null 2>&1`;
+  exec(cmd, () => {});
 }
 
-function runFFTOnSamples(samples) {
-  // pad or trim to FRAME_SIZE
-  if (samples.length < FRAME_SIZE) {
-    // zero-pad
-    const padded = samples.concat(new Array(FRAME_SIZE - samples.length).fill(0));
-    samples = padded;
-  } else if (samples.length > FRAME_SIZE) {
-    samples = samples.slice(0, FRAME_SIZE);
-  }
-  const phasors = fft(samples);
-  const mags = phasors.map(([r, i]) => Math.sqrt(r * r + i * i));
-  return mags;
+function handleNewMessage(freq, mag) {
+  const yesNo = (mag && mag > MIN_GOOD_MAG) ? interpretYesNo(freq) : "MAYBE";
+  const color = mapColor(freq);
+  const message = generateMessage(freq, yesNo, color, mag);
+  lastMessage = message;
+  lastFreq = freq;
+  lastMag = mag;
+  const logLine = `[${nowISO()}] Freq:${freq.toFixed(2)}Hz | ${yesNo} | ${color} | ${message}`;
+  console.log(logLine);
+  appendLog(logLine);
+  // SSE broadcast
+  broadcastToSSE({ ts: nowISO(), message, freq: Number(freq.toFixed(2)), mag: Math.round(mag) });
+  // TTS
+  speakTermuxTTS(message);
+  // webhook
+  notifyWebhook({ ts: nowISO(), message, freq: Number(freq.toFixed(2)), mag: Math.round(mag) });
 }
 
-// ---------- RECORDING + PROCESS LOOP ----------
-function startRecording() {
-  if (running) return;
-  running = true;
-  console.log("Me2You starting microphone capture...");
-
-  // Choose a record program. node-record-lpcm16 will try defaults; on Android
-  // installing 'sox' or 'rec' may help. recordProgram can be 'sox'|'rec'|'arecord'.
-  const rec = record.record({
+// ------------- RECORDING (Live) -------------
+let recording = null;
+function startMicrophoneCapture() {
+  if (recording) return;
+  console.log("Starting microphone capture...");
+  recording = record.record({
     sampleRate: SAMPLE_RATE,
     threshold: 0,
     verbose: false,
-    recordProgram: 'sox', // best-effort cross-platform fallback; may use rec/arecord internally
-    audioType: 'wav'
+    recordProgram: "sox", // cross-platform fallback
+    audioType: "wav"
   });
-
-  const stream = rec.stream();
+  const stream = recording.stream();
   let pending = Buffer.alloc(0);
-
-  stream.on('data', (data) => {
-    // append new data
-    pending = Buffer.concat([pending, data]);
-
-    const neededBytes = FRAME_SIZE * 2;
-    while (pending.length >= neededBytes) {
-      const frame = pending.slice(0, neededBytes);
-      pending = pending.slice(neededBytes);
-
+  stream.on("data", (chunk) => {
+    pending = Buffer.concat([pending, chunk]);
+    const needed = FRAME_SIZE * 2;
+    while (pending.length >= needed) {
+      const frame = pending.slice(0, needed);
+      pending = pending.slice(needed);
       const samples = bufferToSamples(frame);
       const mags = runFFTOnSamples(samples);
       const { freq, magnitude } = getDominantFrequency(mags, SAMPLE_RATE);
-
-      // small noise threshold: ignore tiny mags
-      const yesNo = (magnitude && magnitude > MIN_GOOD_MAG) ? interpretYesNo(freq) : "MAYBE";
-      const color = mapColor(freq);
-      const message = generateMessage(freq, yesNo, color, magnitude);
-
-      lastMessage = message;
-      lastFreq = freq;
-
-      // log & print
-      const logMsg = `Freq: ${freq.toFixed(2)} Hz | ${yesNo} | ${color} | ${message}`;
-      console.log(logMsg);
-      if (ENABLE_ASCII) console.log(asciiSpectrum(mags));
-      try { logLine(freq, yesNo, color, message); } catch (e) { /* ignore */ }
+      handleNewMessage(freq, magnitude);
     }
   });
-
-  stream.on('error', (err) => {
-    console.error("Microphone stream error:", err && err.message ? err.message : err);
-    console.error("If this is 'spawn ENOENT', install 'sox' or 'arecord' in Termux, or use termux-microphone-record to create files.");
+  stream.on("error", (err) => {
+    console.error("Mic stream error:", err && err.message ? err.message : err);
+    console.error("If you see spawn ENOENT, install 'sox' (pkg install sox) or enable file-fallback mode.");
   });
-
-  stream.on('close', () => {
-    console.log("Microphone stream closed.");
-    running = false;
-  });
-
-  console.log("Microphone capture running. Sending audio to analyzer.");
+  console.log("Microphone capture running.");
 }
 
-// ---------- EXPRESS SERVER ----------
+// ------------- FILE FALLBACK (optional) -------------
+function processWavFile(filePath) {
+  // quick WAV parsing for PCM16LE (minimal dependency): read header and raw samples
+  try {
+    const buf = fs.readFileSync(filePath);
+    // very naive WAV header parsing: assume 44-byte header, PCM16LE, mono or stereo
+    if (buf.length < 44) return;
+    const audioStart = 44;
+    const audioBuf = buf.slice(audioStart);
+    // If stereo, we'll just read every 2nd sample (simple downmix)
+    const samples = [];
+    for (let i = 0; i + 1 < audioBuf.length; i += 2) {
+      samples.push(audioBuf.readInt16LE(i) / 32768);
+      if (samples.length >= FRAME_SIZE) break;
+    }
+    if (samples.length < FRAME_SIZE) return;
+    const mags = runFFTOnSamples(samples);
+    const { freq, magnitude } = getDominantFrequency(mags, SAMPLE_RATE);
+    handleNewMessage(freq, magnitude);
+  } catch (e) {
+    console.error("Failed to process wav file:", filePath, e && e.message ? e.message : e);
+  }
+}
+
+function watchRecordingsFolder() {
+  const dir = path.join(process.cwd(), "recordings");
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir);
+  console.log("File-fallback mode active. Watching recordings/ for new WAV files.");
+  fs.watch(dir, { persistent: true }, (event, fname) => {
+    if (!fname) return;
+    const fp = path.join(dir, fname);
+    // tiny delay to ensure file write finished
+    setTimeout(() => {
+      if (fs.existsSync(fp)) processWavFile(fp);
+    }, 800);
+  });
+}
+
+// ------------- EXPRESS SERVER & SSE -------------
 const app = express();
 
-app.get('/me2you', (req, res) => {
-  res.json({
-    message: lastMessage,
-    freq: Number.isFinite(lastFreq) ? Number(lastFreq.toFixed(2)) : null,
-    ts: new Date().toISOString()
+app.get("/", (req, res) => {
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.send(`
+  <!doctype html>
+  <html>
+  <head><meta charset="utf-8"><title>Me2You</title></head>
+  <body style="font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;padding:18px;">
+    <h1>Me2You</h1>
+    <div id="msg">Latest: ${lastMessage}</div>
+    <div id="meta"></div>
+    <script>
+      const evt = new EventSource("/events");
+      evt.onmessage = e => {
+        const d = JSON.parse(e.data);
+        document.getElementById('msg').textContent = d.ts + " — " + d.message;
+        document.getElementById('meta').textContent = "Freq: " + d.freq + " Hz, mag: " + d.mag;
+      };
+    </script>
+  </body>
+  </html>`);
+});
+
+// simple JSON endpoint for Alexa or quick fetch
+app.get("/me2you", (req, res) => {
+  res.json({ message: lastMessage, freq: Number.isFinite(lastFreq) ? Number(lastFreq.toFixed(2)) : null, ts: nowISO() });
+});
+
+// dedicated Alexa-friendly endpoint (returns plain text)
+app.get("/alexa", (req, res) => {
+  // Alexa will convert JSON/SSML to speech in the skill; we provide text.
+  res.json({ speech: lastMessage });
+});
+
+// SSE streaming endpoint
+app.get("/events", (req, res) => {
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  res.write(`retry: 10000\n\n`);
+  clients.push(res);
+  req.on("close", () => {
+    clients = clients.filter((r) => r !== res);
   });
 });
 
-app.get('/status', (req, res) => {
-  res.json({
-    running,
-    lastMessage,
-    lastFreq,
-    port: PORT
-  });
+// status
+app.get("/status", (req, res) => {
+  res.json({ running: !!recording, lastMessage, lastFreq, lastMag, port: PORT });
 });
 
 app.listen(PORT, () => {
-  console.log(`Me2You web endpoint: http://localhost:${PORT}/me2you`);
-  // auto-start microphone capture
-  startRecording();
+  console.log(`Me2You HTTP: http://localhost:${PORT}/`);
+  if (ENABLE_FILE_FALLBACK) watchRecordingsFolder();
+  // start mic capture if not using file fallback only
+  if (!ENABLE_FILE_FALLBACK) startMicrophoneCapture();
 });
 
-// Graceful shutdown
-process.on('SIGINT', () => {
-  console.log("\nShutting down Me2You...");
+// graceful exit
+process.on("SIGINT", () => {
+  console.log("Shutting down Me2You...");
+  try { if (recording) recording.stop(); } catch (e) {}
   process.exit(0);
 });
