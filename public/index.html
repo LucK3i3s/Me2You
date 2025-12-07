@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Me2You UI</title>
+  <style>
+    body { background:black; color:white; font-family:sans-serif; }
+    #spectrum { display:flex; }
+    .bar { width:6px; margin:1px; background:green; }
+    #messages { margin-top:10px; height:150px; overflow:auto; }
+  </style>
+</head>
+<body>
+  <h1>Me2You - Multi-Dimensional Mapping</h1>
+  <div id="spectrum"></div>
+  <div id="symbols"></div>
+  <div id="messages"></div>
+  <script src="/socket.io/socket.io.js"></script>
+  <script>
+    const socket = io();
+    const spectrumDiv = document.getElementById('spectrum');
+    const symbolsDiv = document.getElementById('symbols');
+    const messagesDiv = document.getElementById('messages');
+
+    socket.on('frequency', data => {
+      spectrumDiv.innerHTML = '';
+      data.magnitudes.forEach(m => {
+        const bar = document.createElement('div');
+        bar.className='bar';
+        bar.style.height=(m/Math.max(...data.magnitudes)*100)+'px';
+        spectrumDiv.appendChild(bar);
+      });
+      symbolsDiv.innerText = 'Active Symbols: '+data.symbols.join(' | ');
+      if(data.message){
+        const msg = document.createElement('div');
+        msg.innerText = `[${new Date().toLocaleTimeString()}] ${data.message}`;
+        messagesDiv.appendChild(msg);
+        messagesDiv.scrollTop = messagesDiv.scrollHeight;
+      }
+    });
+  </script>
+</body>
+</html>
