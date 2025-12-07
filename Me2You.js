@@ -1,70 +1,357 @@
-// Me2You.js
-// One-file full system — audio → frequency → code → message → Alexa spoken output
-// Original • Creative • Fully Self-Contained
+// Me2You.mjs
+// Single-file Me2You — Termux-compatible, creative, complete
+// Usage: set config below, then: node Me2You.mjs
+import { spawn } from "child_process";
+import fs from "fs";
+import path from "path";
+import { fft } from "fft-js";
+import crypto from "crypto";
+import os from "os";
+import http from "http";
+import express from "express";
 
-import { DeviceStream } from "@react-voice/pcm";
-import FFT from "fft-js").fft;
-import { fftUtil } from "fft-js";
-import fetch from "node-fetch";
+// ---------------- CONFIGURATION ----------------
+// Edit these constants to fit your environment
+const SAMPLE_RATE = 16000;
+const FRAME_SIZE = 2048;
+const PORT = process.env.PORT ? Number(process.env.PORT) : 3000;
+const LOG_FILE = "me2you_log.txt";
+const MIN_MAGNITUDE = 1000;       // threshold to call a peak "real"
+const ENABLE_TTS = process.env.ME2YOU_TTS === "1";         // termux-tts on new message
+const ENABLE_VIBRATE = process.env.ME2YOU_VIBE === "1";    // termux-vibrate on new message
+const ENABLE_OBSERVER = process.env.ME2YOU_OBSERVER === "1";// ascii visual
+const SILENT_MODE = process.env.ME2YOU_SILENT === "1";     // no TTS/vibe/logging if set
+const ENABLE_FILE_FALLBACK = process.env.ME2YOU_FILEMODE === "1"; // watch recordings/
 
-// ----------------------------
-// CONFIG
-// ----------------------------
+// Optional webhook to forward messages (will be AES-GCM encrypted if ENCRYPTION_KEY set)
+const WEBHOOK_URL = process.env.ME2YOU_WEBHOOK || ""; // e.g. https://your-server/receive
 
-// ALEXA CREDENTIALS — Replace with your own Alexa Skill token
-const ALEXA_SKILL_ENDPOINT = "https://api.amazonalexa.com/v1/directives";
-const ALEXA_ACCESS_TOKEN = "YOUR_ALEXA_ACCESS_TOKEN"; // Insert yours
+// Encryption: 32-byte base64 key for AES-GCM (optional)
+const ENCRYPTION_KEY_B64 = process.env.ME2YOU_KEY_B64 || ""; // set if you want encrypted webhooks
 
-// Flow-state decoding patterns
-const patterns = {
+// Alexa / external fetch usage:
+// For simple Alexa skill use: skill will call your /alexa endpoint (see instructions)
+// For advanced push to Alexa you need AWS + Alexa notifications (advanced)
+const ALLOW_PUBLIC = true; // if true you can expose via ngrok; otherwise keep local
+
+// Custom signature mapping (your "flow-state equation")
+// Fill with signature keys -> messages. Signature keys are strings like "6R6B"
+const SIGNATURES = {
   "6R6B": "Alignment Shift — Observe the transition.",
   "6R7B": "Threshold Expansion — A message is forming.",
   "7R6B": "Observer Phase — Ninth Seal vibration.",
+  // add your own custom patterns...
 };
 
-// ----------------------------
-// Function: Send message to Alexa to SPEAK IT
-// ----------------------------
-async function speakToAlexa(text) {
-  const body = {
-    directive: {
-      header: { name: "Speak", namespace: "SpeechSynthesizer" },
-      payload: { text }
-    }
-  };
+// ---------------- STATE ----------------
+let lastMessage = "No signal detected yet.";
+let lastFreq = 0;
+let lastMag = 0;
+let lastSignatureKey = null;
 
-  try {
-    await fetch(ALEXA_SKILL_ENDPOINT, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${ALEXA_ACCESS_TOKEN}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify(body)
-    });
+// SSE clients
+const sseClients = [];
 
-    console.log("Alexa spoke:", text);
-  } catch (err) {
-    console.error("Alexa Error:", err);
+// ---------------- HELPERS ----------------
+function nowISO() { return new Date().toISOString(); }
+function appendLog(line) {
+  try { fs.appendFileSync(LOG_FILE, line + os.EOL); } catch (e) { /* ignore */ }
+}
+function encryptPayload(plain) {
+  if (!ENCRYPTION_KEY_B64) return null;
+  const key = Buffer.from(ENCRYPTION_KEY_B64, "base64");
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv("aes-256-gcm", key, iv);
+  const enc = Buffer.concat([cipher.update(Buffer.from(plain, "utf8")), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return Buffer.concat([iv, tag, enc]).toString("base64");
+}
+function sha1hex(s) { return crypto.createHash("sha1").update(s).digest("hex"); }
+
+// Convert PCM Buffer (Int16LE) to normalized float samples (-1..1)
+function bufferToSamples(buffer) {
+  const sampleCount = Math.floor(buffer.length / 2);
+  const out = new Array(sampleCount);
+  for (let i = 0; i < sampleCount; i++) {
+    out[i] = buffer.readInt16LE(i * 2) / 32768;
   }
+  return out;
 }
 
-// ----------------------------
-// Decode blink pattern (your equation)
-// ----------------------------
-function decodeBlinkPattern(redCount, blueCount) {
-  const key = `${redCount}R${blueCount}B`;
-  return patterns[key] || `Unclassified Frequency Pattern: ${key}`;
+// Run FFT and return magnitudes
+function runFFT(samples) {
+  // ensure length FRAME_SIZE
+  if (samples.length < FRAME_SIZE) {
+    samples = samples.concat(new Array(FRAME_SIZE - samples.length).fill(0));
+  } else if (samples.length > FRAME_SIZE) {
+    samples = samples.slice(0, FRAME_SIZE);
+  }
+  const ph = fft(samples);
+  const mags = ph.map(([r, i]) => Math.sqrt(r*r + i*i));
+  return mags;
 }
 
-// ----------------------------
-// Analyze frequency from PCM chunk
-// ----------------------------
-function analyzeFrequencies(chunk) {
-  // Convert to numbers
-  const samples = [];
-  for (let i = 0; i < chunk.length; i += 2) {
-    samples.push(chunk.readInt16LE(i));
+// Find dominant freq and magnitude
+function dominantFreqFromMags(mags, sampleRate) {
+  const half = Math.floor(mags.length / 2);
+  let idx = 1, max = -Infinity;
+  for (let i = 1; i < half; i++) {
+    if (mags[i] > max) { max = mags[i]; idx = i; }
+  }
+  const freq = idx * (sampleRate / mags.length);
+  return { freq, mag: max };
+}
+
+// Map freq -> yes/no/maybe
+function interpretYesNo(freq) {
+  if (!freq || isNaN(freq)) return "MAYBE";
+  if (freq > 1000) return "YES";
+  if (freq < 200) return "NO";
+  return "MAYBE";
+}
+function mapColor(freq) {
+  if (!freq || isNaN(freq)) return "Gray";
+  if (freq < 300) return "Red";
+  if (freq < 700) return "Green";
+  if (freq < 1500) return "Blue";
+  return "Violet";
+}
+
+// Flow-state signature detector — counts "red band" and "blue band" peaks within the FFT frame
+function detectSignature(mags) {
+  let red = 0, blue = 0;
+  const N = mags.length;
+  for (let i = 1; i < Math.floor(N/2); i++) {
+    const freq = i * (SAMPLE_RATE / N);
+    const m = mags[i];
+    // thresholds tuned heuristically; you can tweak
+    if (freq >= 420 && freq <= 850 && m > MIN_MAGNITUDE) red++;
+    if (freq >= 1200 && freq <= 2000 && m > MIN_MAGNITUDE) blue++;
+  }
+  const key = `${red}R${blue}B`;
+  return { red, blue, key };
+}
+
+// Tiny ASCII observer sparkline
+function asciiSpark(mags) {
+  const half = Math.floor(mags.length/2);
+  const slice = mags.slice(0, half);
+  const max = Math.max(...slice) || 1;
+  let s = "";
+  const width = 60;
+  for (let i = 0; i < width; i++) {
+    const idx = Math.floor((i/width) * slice.length);
+    const v = slice[idx] / max;
+    s += (v > 0.7 ? "#" : v > 0.4 ? "+" : v > 0.15 ? "-" : " ");
+  }
+  return s;
+}
+
+// send webhook (encrypted if key provided)
+function sendWebhook(obj) {
+  if (!WEBHOOK_URL) return;
+  try {
+    const payload = JSON.stringify(obj);
+    const enc = ENCRYPTION_KEY_B64 ? encryptPayload(payload) : payload;
+    const curl = spawn("curl", ["-s", "-X", "POST", "-H", "Content-Type: application/json", "-d", enc, WEBHOOK_URL], { stdio: "ignore" });
+    curl.on("error", ()=>{});
+  } catch(e){}
+}
+
+// TTS and vibrate helpers (Termux)
+function ttsSpeak(text) {
+  if (!ENABLE_TTS || SILENT_MODE) return;
+  // termux-tts-speak must be installed (pkg install termux-api)
+  spawn("termux-tts-speak", [text]);
+}
+function vibratePattern() {
+  if (!ENABLE_VIBRATE || SILENT_MODE) return;
+  // short vibration
+  spawn("termux-vibrate", ["-d", "200"]);
+}
+
+// New message handler
+function onNewMessage(freq, mag, mags) {
+  const yesNo = (mag && mag > MIN_MAGNITUDE) ? interpretYesNo(freq) : "MAYBE";
+  const color = mapColor(freq);
+  const signature = detectSignature(mags);
+  lastFreq = freq; lastMag = mag;
+  const signatureKey = signature.key;
+  lastSignatureKey = signatureKey;
+
+  // signature message mapping
+  const signatureMsg = SIGNATURES[signatureKey] || (signature.red+signature.blue > 0 ? `Pattern ${signatureKey}` : "");
+  const creativeMsg = (yesNo === "YES" ? "Affirmative signal." : yesNo === "NO" ? "No clear signal." : "Unclear response.");
+  const fullMessage = `${creativeMsg} Color: ${color}. Peak: ${freq.toFixed(1)} Hz. ${signatureMsg}`;
+
+  lastMessage = fullMessage;
+
+  const log = `[${nowISO()}] ${fullMessage} (sig=${signatureKey} red=${signature.red} blue=${signature.blue} mag=${Math.round(mag)})`;
+  if (!SILENT_MODE) console.log(log);
+  appendLog(log);
+
+  // SSE broadcast
+  const sseObj = { ts: nowISO(), message: fullMessage, freq: Number(freq.toFixed(2)), mag: Math.round(mag), signature: signatureKey };
+  const sseStr = `data: ${JSON.stringify(sseObj)}\n\n`;
+  for (const res of sseClients) {
+    try { res.write(sseStr); } catch(e){}
+  }
+
+  // actions
+  if (!SILENT_MODE) {
+    ttsSpeak(fullMessage);
+    vibratePattern();
+  }
+
+  // webhook (encrypted if key set)
+  sendWebhook(sseObj);
+}
+
+// ---------------- RECORDING & PROCESS ----------------
+let recorderProc = null;
+function startRecordingStream() {
+  // Use termux-microphone-record to write a rolling file and we will stream in chunks.
+  // Alternatively we spawn the CLI and read the wav file repeatedly.
+  // We'll create /data/data/com.termux/files/home/me2you/audio_stream.wav
+  const out = path.join(process.cwd(), "audio_stream.wav");
+  // Remove existing if present
+  try { if (fs.existsSync(out)) fs.unlinkSync(out); } catch(e){}
+
+  // run termux-microphone-record with -l infinity and write to audio_stream.wav
+  recorderProc = spawn("termux-microphone-record", ["-l", "infinity", "-f", "wav", "-o", out], { detached: true });
+
+  recorderProc.on("error", (e) => {
+    console.error("Recorder start failed:", e && e.message ? e.message : e);
+    console.error("Make sure termux-api is installed and granted microphone permission.");
+  });
+
+  recorderProc.on("spawn", () => {
+    if (!SILENT_MODE) console.log("Recorder spawned; audio file:", out);
+  });
+
+  // Poll the file for new data and read frames
+  let lastRead = 0;
+  const frameBytes = FRAME_SIZE * 2; // 2 bytes per sample (Int16)
+  setInterval(() => {
+    try {
+      if (!fs.existsSync(out)) return;
+      const stats = fs.statSync(out);
+      if (stats.size <= 44 + lastRead) return; // WAV header 44 bytes
+      const fd = fs.openSync(out, "r");
+      const start = 44 + lastRead;
+      const toRead = Math.min(frameBytes * 4, stats.size - start); // read a chunk of several frames
+      const buf = Buffer.alloc(toRead);
+      fs.readSync(fd, buf, 0, toRead, start);
+      fs.closeSync(fd);
+      // process buffer in FRAME_SIZE-chunks
+      let pos = 0;
+      while (pos + frameBytes <= buf.length) {
+        const frameBuf = buf.slice(pos, pos + frameBytes);
+        const samples = bufferToSamples(frameBuf);
+        const mags = runFFT(samples);
+        const { freq, mag } = dominantFreqFromMags(mags, SAMPLE_RATE);
+        if (mag > MIN_MAGNITUDE) onNewMessage(freq, mag, mags);
+        else onNewMessage(freq, mag, mags); // still process but may be MAYBE
+        pos += frameBytes;
+      }
+      lastRead += pos;
+    } catch (e) {
+      // ignore transient read errors
+    }
+  }, 600); // poll ~every 600ms
+}
+
+// File fallback: watch recordings/ and process new files
+function watchRecordings() {
+  const dir = path.join(process.cwd(), "recordings");
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir);
+  fs.watch(dir, (evt, fname) => {
+    if (!fname) return;
+    setTimeout(() => {
+      const fp = path.join(dir, fname);
+      if (!fs.existsSync(fp)) return;
+      try {
+        const buf = fs.readFileSync(fp);
+        // naively treat as wav file
+        if (buf.length < 44) return;
+        const audio = buf.slice(44, 44 + FRAME_SIZE*2);
+        const samples = bufferToSamples(audio);
+        const mags = runFFT(samples);
+        const { freq, mag } = dominantFreqFromMags(mags, SAMPLE_RATE);
+        onNewMessage(freq, mag, mags);
+      } catch(e){}
+    }, 900);
+  });
+}
+
+// ---------------- EXPRESS / SSE / UI ----------------
+const app = express();
+
+app.get("/", (req, res) => {
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.send(`
+    <html><head><title>Me2You</title></head><body style="font-family: system-ui, Roboto, -apple-system; padding:18px;">
+      <h1>Me2You</h1>
+      <p>Latest: <b id="msg">${lastMessage}</b></p>
+      <p id="meta"></p>
+      <button onclick="fetch('/me2you').then(r=>r.json()).then(j=>alert(j.message))">Get Latest</button>
+      <pre id="log" style="height:220px;overflow:auto;border:1px solid #ddd;padding:8px;"></pre>
+      <script>
+        const es = new EventSource('/events');
+        es.onmessage = e => {
+          const d = JSON.parse(e.data);
+          document.getElementById('msg').textContent = d.message;
+          document.getElementById('meta').textContent = 'Freq: ' + d.freq + ' Hz, mag: ' + d.mag + ', sig:' + d.signature;
+          const log = document.getElementById('log');
+          log.textContent = (new Date(d.ts)).toLocaleString() + ' — ' + d.message + '\\n' + log.textContent;
+        };
+        // fetch last log lines
+        fetch('/log').then(r=>r.text()).then(t=>document.getElementById('log').textContent = t.split('\\n').reverse().slice(0,40).join('\\n'));
+      </script>
+    </body></html>`);
+});
+
+// JSON endpoints
+app.get("/me2you", (req,res) => {
+  res.json({ message: lastMessage, freq: Number.isFinite(lastFreq) ? Number(lastFreq.toFixed(2)) : null, ts: nowISO(), signature: lastSignatureKey });
+});
+
+// Alexa-friendly endpoint: return simple speech text (skill should fetch this and speak it)
+app.get("/alexa", (req,res) => {
+  res.json({ speech: lastMessage });
+});
+
+// SSE events
+app.get("/events", (req,res) => {
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  res.write("retry: 10000\n\n");
+  sseClients.push(res);
+  req.on("close", () => { const i = sseClients.indexOf(res); if (i>=0) sseClients.splice(i,1); });
+});
+
+// return raw log
+app.get("/log", (req,res) => {
+  try { const t = fs.readFileSync(LOG_FILE, "utf8"); res.type("text/plain").send(t); } catch(e){ res.type("text/plain").send(""); }
+});
+
+// status
+app.get("/status", (req,res) => res.json({ running: !!recorderProc, lastMessage, lastFreq, lastMag }));
+
+app.listen(PORT, () => {
+  console.log(`Me2You HTTP: http://localhost:${PORT}/  (SSE: /events, Alexa: /alexa)`);
+  if (ENABLE_FILE_FALLBACK) watchRecordings();
+  startRecordingStream();
+  if (ENABLE_OBSERVER && !SILENT_MODE) console.log("Observer mode ASCII enabled.");
+});
+
+// ---------------- graceful exit ----------------
+process.on("SIGINT", () => {
+  try { if (recorderProc) recorderProc.kill(); } catch(e){}
+  console.log("Shutting down Me2You...");
+  process.exit(0);
+});    samples.push(chunk.readInt16LE(i));
   }
 
   const phasors = FFT(samples);
